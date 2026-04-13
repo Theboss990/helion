@@ -2795,6 +2795,7 @@ class MetalBackend(Backend):
     _SUPPORTED_CONFIG_KEYS: frozenset[str] = frozenset(
         {
             "block_sizes",
+            "num_threads",
             "num_warps",
         }
     )
@@ -2849,13 +2850,46 @@ class MetalBackend(Backend):
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         return f"static_cast<{dtype_str}>({expr_str})"
 
+    def lane_index_expr(
+        self, offset_var: str, elements_per_thread: int, *, axis: int
+    ) -> str:
+        return f"{offset_var} + tid[{axis}] * {elements_per_thread}"
+
+    def lane_offset_expr(self, lane_var: str) -> str:
+        return lane_var
+
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         return f"tgid[{dim}]"
 
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
+        if block_size_var == "1":
+            return offset_var
         return f"{offset_var} + tid[{axis}]"
+
+    def loop_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        if block_size_var == "1":
+            return offset_var
+        return f"{offset_var} + tid[{axis}]"
+
+    def arange_expr(
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
+    ) -> str:
+        return f"{offsets_var} = ({lid}) * ({block_size_var}) + tid[{axis}]"
+
+    def thread_in_tile_mask_expr(
+        self, block_size_var: str, *, axis: int = 0
+    ) -> str | None:
+        return f"tid[{axis}] < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
         return True
@@ -2928,3 +2962,155 @@ class MetalBackend(Backend):
 
         dims = tuple(DeviceFunction.current().codegen.max_thread_block_dims)
         return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2]})"]
+
+    def build_launcher_args(
+        self,
+        args: list[str],
+        *,
+        tensor_host_args: list[str],
+        has_rng_ops: bool,
+        config: Config,
+        has_barrier: bool,
+        sorted_args: list[Argument] | None = None,
+    ) -> list[str]:
+        if has_rng_ops:
+            raise exc.BackendUnsupported(self.name, "RNG ops")
+        return [*args, *self.launcher_keyword_args(config, has_barrier=has_barrier)]
+
+    def create_loop_strategy(
+        self, fn: DeviceFunction, block_ids: list[int], config: Config
+    ) -> TileStrategy:
+        """Metal loop strategy: auto-cap threadgroup size to 1024.
+
+        Always uses CuteND/CuteFlattenedTileStrategy (which support lane
+        loops).  When the product of block_sizes exceeds 1024 (Metal's
+        hard limit), auto-caps num_threads so each thread processes
+        multiple elements via lane loops.
+        """
+        from .compile_environment import CompileEnvironment
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+        from .device_ir import ForLoopGraphInfo
+        from .device_ir import ReductionLoopGraphInfo
+        from .host_function import HostFunction
+        from .tile_strategy import CuteFlattenedTileStrategy
+        from .tile_strategy import CuteNDTileStrategy
+
+        env = CompileEnvironment.current()
+        device_ir = HostFunction.current().device_ir
+        block_size_infos = [env.block_sizes[i] for i in block_ids]
+        flattened = block_size_infos[0].is_flattened(config)
+        loop_order = env.config_spec.loop_orders.config_get(
+            config.loop_orders, block_ids[0]
+        ) or [*range(len(block_ids))]
+        l2_grouping = env.config_spec.l2_groupings.config_get(
+            config.l2_groupings, block_ids[0], 1
+        )
+        has_device_loops = any(
+            isinstance(graph, ForLoopGraphInfo)
+            and not isinstance(graph, ReductionLoopGraphInfo)
+            for graph in fn.codegen.codegen_graphs
+        )
+        has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
+        grid_ids = {bid for ids in device_ir.grid_block_ids for bid in ids}
+        num_threads_config = [
+            int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
+            for block_id in block_ids
+        ]
+
+        # Check total thread count across all non-reduction block axes
+        all_block_infos = [env.block_sizes[i] for i in range(len(env.block_sizes))]
+        total_threads = 1
+        for info in all_block_infos:
+            if info.reduction:
+                continue
+            bs = info.from_config(config)
+            if isinstance(bs, int):
+                nt = int(
+                    env.config_spec.num_threads.config_get(
+                        config.num_threads, info.block_id, 0
+                    )
+                )
+                total_threads *= nt if nt > 0 else bs
+        if total_threads > MAX_THREADS_PER_BLOCK:
+            for i, block_id in enumerate(block_ids):
+                if num_threads_config[i] == 0 and block_id not in grid_ids:
+                    num_threads_config[i] = 1
+
+        if (
+            has_device_loops
+            or has_dynamic_shape
+            or len(device_ir.grid_block_ids) != 1
+            or (len(block_ids) > 1 and not flattened)
+        ):
+            nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
+            int_positions = [
+                i for i, bs in enumerate(nd_block_size) if isinstance(bs, int)
+            ]
+            # Auto-cap: iteratively halve the largest axis's thread count
+            static_threads = functools.reduce(
+                operator.mul,
+                (
+                    num_threads_config[i]
+                    if num_threads_config[i] > 0
+                    else int(nd_block_size[i])
+                    for i in int_positions
+                ),
+                1,
+            )
+            while static_threads > MAX_THREADS_PER_BLOCK:
+                best_idx = -1
+                best_bs = 0
+                for i in int_positions:
+                    if num_threads_config[i] == 0:
+                        bs = int(nd_block_size[i])
+                    else:
+                        bs = num_threads_config[i]
+                    if bs > best_bs and bs > 1:
+                        best_bs = bs
+                        best_idx = i
+                if best_idx < 0:
+                    break
+                new_nt = max(1, best_bs // 2)
+                num_threads_config[best_idx] = new_nt
+                static_threads = functools.reduce(
+                    operator.mul,
+                    (
+                        num_threads_config[i]
+                        if num_threads_config[i] > 0
+                        else int(nd_block_size[i])
+                        for i in int_positions
+                    ),
+                    1,
+                )
+            return CuteNDTileStrategy(
+                fn,
+                block_ids,
+                block_size=nd_block_size,
+                loop_order=loop_order,
+                l2_grouping=l2_grouping,
+                num_threads=num_threads_config,
+            )
+
+        # Flattened 1D path
+        nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
+        block_size = functools.reduce(operator.mul, nd_block_size)
+        flat_num_threads = functools.reduce(
+            operator.mul,
+            (
+                nt if nt > 0 else (int(bs) if isinstance(bs, int) else 0)
+                for nt, bs in zip(num_threads_config, nd_block_size, strict=True)
+            ),
+            1,
+        )
+        # Auto-cap: when block_size exceeds hardware limit, cap to
+        # MAX_THREADS_PER_BLOCK and let each thread process multiple
+        # elements via lane loops.
+        if isinstance(block_size, int) and flat_num_threads > MAX_THREADS_PER_BLOCK:
+            flat_num_threads = MAX_THREADS_PER_BLOCK
+        return CuteFlattenedTileStrategy(
+            fn,
+            block_ids,
+            block_size=block_size,
+            loop_order=loop_order,
+            num_threads=flat_num_threads,
+        )
