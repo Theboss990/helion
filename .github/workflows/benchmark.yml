@@ -132,8 +132,8 @@ jobs:
           uv pip install quack-kernels --no-deps
           mkdir -p benchmarks/ && pushd benchmarks/
           git clone https://github.com/pytorch-labs/tritonbench/
-          git checkout c8d36ec77cf9e332c3345225418b44f94b64b324
           pushd tritonbench/
+          git checkout c8d36ec77cf9e332c3345225418b44f94b64b324
           git submodule update --init --recursive
           uv pip install -r requirements.txt
           python install.py --liger
