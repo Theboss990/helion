@@ -133,7 +133,7 @@ jobs:
           mkdir -p benchmarks/ && pushd benchmarks/
           git clone https://github.com/pytorch-labs/tritonbench/
           pushd tritonbench/
-          git checkout c8d36ec77cf9e332c3345225418b44f94b64b324
+          git checkout f84f4a152e75976d9cec1da7f6a56558506bb553
           git submodule update --init --recursive
           uv pip install -r requirements.txt
           python install.py --liger
